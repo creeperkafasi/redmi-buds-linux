@@ -71,6 +71,15 @@ fn snapshot(buds: &mut Buds, mac: &str) -> std::io::Result<Snapshot> {
 }
 
 fn open(mac: &str) -> std::io::Result<Buds> {
+    // Ask BlueZ to connect the buds first, exactly like the desktop's own
+    // Bluetooth menu does. Opening the RFCOMM socket alone does bring the ACL
+    // link up, but without the audio profiles: PipeWire never creates a card
+    // and the buds look "connected" with no sound device (the same call the
+    // earphone app makes on Android, where the system handles the profiles).
+    let _ = Command::new("bluetoothctl")
+        .args(["--timeout", "15", "connect", mac])
+        .output();
+
     let mut buds = Buds::connect(mac, None, false)?;
     buds.authenticate()?;
     Ok(buds)

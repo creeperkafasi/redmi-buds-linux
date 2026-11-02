@@ -46,7 +46,10 @@ connect from the computer: `bluetoothctl connect <MAC>`.
 
 The GUI finds paired buds by itself, keeps one session open, refreshes the
 battery every 20 s and reconnects on its own. Pass `--mac <ADDR>` to pick a
-device.
+device. It connects through BlueZ (`bluetoothctl connect <MAC>`) before opening
+the control channel: the RFCOMM session alone brings the link up but not the
+audio profiles, so PipeWire would never create a card and the buds would look
+connected with no sound device.
 
 ```sh
 redmi-buds battery                     # L=100%⚡  R=100%⚡  case=40%
