@@ -297,7 +297,7 @@ Observed values and their encodings:
 | 37 | adaptive ANC | `00` |
 | 39 | serial number | ASCII, `<5 digits>/<14 alphanumerics>` |
 | 40 | time | 4 bytes, Unix-ish (`6a e5 ea 70`) |
-| 55 | custom EQ | `00` |
+| 55 | **custom EQ** | report + set/preview/reset TLVs, see below. `00` on the 6 Play (feature absent) |
 | 83 | click set (newer models) | `DeviceConfigClickSet` in `setting/function/` → id 83. **Not** the class used for these buds |
 | 93 | restricted | `00` |
 
@@ -358,6 +358,57 @@ Traps, all confirmed on the 6 Lite:
 - The app refuses to switch modes while the buds sit in the case (the taps do
   nothing), so test or script the change with the buds outside it.
 
+### Custom equalizer (verified on the Buds 6 Lite, 2026-11-02)
+
+Config id 55 carries a ten-band curve. It is a command channel rather than a
+plain value: the first bytes say which sub-command the payload is. The layouts
+come from the app's `DeviceConfigCustomEq` (reads: `valueToParams`, writes:
+`paramsToValue`).
+
+**Report** (what a GET returns):
+
+```
+01 | mode | maxBound | minBound | eqID | nameLen | name… | count
+                                                  | band 0..count:
+                                                    freq (u16 BE) | gain (u8)
+```
+
+Gains are symmetric: `0..127` is `0..+127`, `128 + n` is `-n` (`86` = −6).
+The 6 Lite reports mode 10 (`Personalized`), bounds `06 06`, and ten bands:
+62, 125, 250, 500, 1000, 2000, 4000, 8000, 12000, 16000 Hz. `nameLen` is 0;
+the app skips that many bytes either way.
+
+**Writes:**
+
+| sub-command | payload | meaning |
+|---|---|---|
+| 1 `CMD_SET_CUSTOM_EQ` | `01 0a 01 01 01 00 <count>` + bands | store the curve |
+| 5 `CMD_CUSTOM_EQ_PREVIEW` | `05 01 01 <count>` + bands | apply the curve |
+| 4 `CMD_RESET_CUSTOM_EQ` | `04 01 01 01` | flat curve |
+| 3 `CMD_SELECT_EQ_MODE` | `01 <mode>` | select preset (same as config id 7) |
+
+The app hardcodes the mode byte 10 and the three `01`s in the set header; the
+firmware echoes them back, so the report afterwards reads `… 01 00 …`.
+
+Traps, all confirmed on the 6 Lite:
+
+- **Sub-command 1 alone is inaudible.** The value reads back changed, so a
+  write/read test passes, but the DSP keeps playing the old curve. Same
+  "stored but not applied" trap as config id 11.
+- **Sub-command 5 is the one that moves the audio path.** It also changes what
+  config id 55 reports, so it is not a pure audition: treat 5 as "store and
+  apply", and 1 as "store for the next preset load".
+- The stored curve becomes audible when mode 10 is (re)selected, either after
+  switching to another preset or from the phone app. Re-selecting 10 while it
+  is already active is a no-op.
+- The device stores gains outside the reported bound (`09` is echoed as `09`);
+  the ±6 dB limit lives in the app's UI, not in the firmware.
+- Send the bands in the reported order with the reported frequencies; the
+  firmware neither sorts them nor fills in missing ones.
+
+The desktop client therefore sends 1 then 5 for a normal edit, and 5 alone
+while a GUI slider moves.
+
 ## Firmware capabilities, probed (2026-10-31)
 
 Probed with `examples/probe.rs` against the real buds: write a value, read it
@@ -381,7 +432,7 @@ list (`DeviceModel.hasFunction`), not by the firmware.
 | 2 | gestures | four slots: single (4), double (1), triple (2), hold (3); type 0 aliases single tap. Actions 0–5 and 8 work. **9 = take photo** is accepted; on single tap or hold it couples the two slots of that bud (setting either sets both, clearing one resets the other to 0 = voice assistant), on double or triple tap it is independent. Actions 6, 7, 10–13 → `not_supported`; 14–255 are silently ignored (full sweep over types 0–15). **No swipe:** type 5 (slide) and types 6–15 are acknowledged but never stored, and a left-bud swipe set to volume (11) or volume up (4) did nothing when tested by hand |
 | 4 | multipoint / dual connection | `not_supported` |
 | 8 | device name (not in the app's table) | readable (`Redmi Buds 6 Play`), writes ignored |
-| 55 | custom EQ (`01 0a 01 01 01 00 N [freq_be16 gain]…`) | ignored |
+| 55 | custom EQ (`01 0a 01 01 01 00 N [freq_be16 gain]…`) | ignored on the 6 Play (no custom EQ there; the 6 Lite implements it, see above) |
 | 3, 5, 6, 10–13, 29, 36, 37, 41, 54, 58–60, 72, 89, 96, 97, 100, 102–104, 115, 122, 126, 161 | auto-answer, fit test, ANC, call listener, spatial, adaptive volume, … | ignored on the 6 Play (no ANC hardware); id 11 works on the 6 Lite (see above) |
 
 ### EQ preset ids across the product line

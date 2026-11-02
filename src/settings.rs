@@ -102,6 +102,112 @@ pub fn noise_cycle_names(mask: u8) -> Vec<&'static str> {
         .collect()
 }
 
+/// Config id of the custom equalizer (`DeviceConfigCustomEq`).
+pub const CFG_CUSTOM_EQ: u16 = 55;
+
+/// Preset id that makes the custom bands audible ("Personalized").
+pub const EQ_PERSONALIZED: u8 = 10;
+
+/// One band of the custom equalizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EqBand {
+    pub freq: u16,
+    pub gain: i8,
+}
+
+impl EqBand {
+    /// Compact axis label: `62 Hz`, `1 kHz`, `12 kHz`.
+    pub fn label(&self) -> String {
+        if self.freq < 1000 {
+            format!("{} Hz", self.freq)
+        } else if self.freq % 1000 == 0 {
+            format!("{} kHz", self.freq / 1000)
+        } else {
+            format!("{:.1} kHz", self.freq as f32 / 1000.0)
+        }
+    }
+}
+
+/// What the buds report about the custom curve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CustomEq {
+    /// Sound-effect mode the stored curve belongs to (10 on the 6 Lite).
+    pub mode: u8,
+    /// The curve is limited to `-bound ..= bound` dB.
+    pub bound: i8,
+    pub bands: Vec<EqBand>,
+}
+
+/// Gain byte: negatives are stored as `128 + |gain|`.
+fn gain_to_byte(gain: i8) -> u8 {
+    if gain < 0 {
+        (128 - gain as i16) as u8
+    } else {
+        gain as u8
+    }
+}
+
+fn gain_from_byte(value: u8) -> i8 {
+    if value < 128 {
+        value as i8
+    } else {
+        (128 - value as i16) as i8
+    }
+}
+
+/// Decode the `CMD_REPORT_EQ_PARAMS` value of config id 55.
+///
+/// Layout, from the app's `DeviceConfigCustomEq.valueToParams`:
+/// `version | mode | bound | bound | eq_id | name_len | name… | count`, then
+/// `count` × (`freq u16 BE` | `gain u8`).
+pub fn decode_custom_eq(value: &[u8]) -> Option<CustomEq> {
+    if value.len() < 7 || value[0] != 1 {
+        return None;
+    }
+    let mode = value[1];
+    let bound = if value[2] == 0 { 10 } else { value[2] as i8 };
+    let mut at = 6 + value[5] as usize;
+    let count = *value.get(at)? as usize;
+    at += 1;
+    let mut bands = Vec::new();
+    // The app stops as soon as fewer than three bytes are left.
+    while value.len() - at > 2 && bands.len() < count {
+        let freq = u16::from_be_bytes([value[at], value[at + 1]]);
+        bands.push(EqBand {
+            freq,
+            gain: gain_from_byte(value[at + 2]),
+        });
+        at += 3;
+    }
+    Some(CustomEq { mode, bound, bands })
+}
+
+/// Encode `CMD_SET_CUSTOM_EQ`: store the curve in the personalized slot.
+pub fn encode_custom_eq(bands: &[EqBand]) -> Vec<u8> {
+    // The header is the app's hardcoded `{1, 10, 1, 1, 1, 0, count}`.
+    let mut out = vec![1, EQ_PERSONALIZED, 1, 1, 1, 0, bands.len() as u8];
+    for band in bands {
+        out.extend_from_slice(&band.freq.to_be_bytes());
+        out.push(gain_to_byte(band.gain));
+    }
+    out
+}
+
+/// Encode `CMD_CUSTOM_EQ_PREVIEW`: hear the curve without storing it.
+pub fn encode_custom_eq_preview(bands: &[EqBand]) -> Vec<u8> {
+    let mut out = vec![5, 1, 1, bands.len() as u8];
+    for band in bands {
+        out.extend_from_slice(&band.freq.to_be_bytes());
+        out.push(gain_to_byte(band.gain));
+    }
+    out
+}
+
+/// Encode `CMD_RESET_CUSTOM_EQ`: back to the flat curve.
+pub fn encode_custom_eq_reset() -> Vec<u8> {
+    vec![4, 1, 1, 1]
+}
+
 /// The presets the app offers for this model, in app order. The ids are the
 /// values the capture shows the app writing to config id 7.
 pub const EQ_PRESETS: [(u8, &str); 6] = [
@@ -329,6 +435,50 @@ mod tests {
         assert_eq!(noise_cycle_names(0x03), vec!["Off", "Noise cancelling"]);
         // High bits outside 0..2 are ignored
         assert_eq!(noise_cycle_names(0xF8), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn custom_eq_round_trip() {
+        // Verbatim read of config id 55 from a Redmi Buds 6 Lite.
+        let raw = crate::auth::hex_decode(
+            "010a060600000a003e06007d0600fa8601f40603e88607d0060fa0861f40862ee0863e8086",
+        )
+        .unwrap();
+        let eq = decode_custom_eq(&raw).expect("decodes");
+        assert_eq!(eq.mode, 10);
+        assert_eq!(eq.bound, 6);
+        assert_eq!(
+            eq.bands,
+            vec![
+                EqBand { freq: 62, gain: 6 },
+                EqBand { freq: 125, gain: 6 },
+                EqBand { freq: 250, gain: -6 },
+                EqBand { freq: 500, gain: 6 },
+                EqBand { freq: 1000, gain: -6 },
+                EqBand { freq: 2000, gain: 6 },
+                EqBand { freq: 4000, gain: -6 },
+                EqBand { freq: 8000, gain: -6 },
+                EqBand { freq: 12000, gain: -6 },
+                EqBand { freq: 16000, gain: -6 },
+            ]
+        );
+        assert_eq!(eq.bands[0].label(), "62 Hz");
+        assert_eq!(eq.bands[4].label(), "1 kHz");
+
+        // The write header differs from the report: the app hardcodes
+        // {1, 10, 1, 1, 1, 0, count} for CMD_SET_CUSTOM_EQ.
+        let set = encode_custom_eq(&eq.bands);
+        assert_eq!(&set[..7], &[1, 10, 1, 1, 1, 0, 10]);
+        assert_eq!(&set[7..10], &[0x00, 0x3e, 0x06]);
+        assert_eq!(set.len(), raw.len());
+        assert_eq!(&set[7..], &raw[7..]);
+
+        // Preview swaps the header and keeps the bands.
+        let preview = encode_custom_eq_preview(&eq.bands);
+        assert_eq!(&preview[..4], &[5, 1, 1, 10]);
+        assert_eq!(&preview[4..], &raw[7..]);
+        assert_eq!(encode_custom_eq_reset(), vec![4, 1, 1, 1]);
+        assert_eq!(decode_custom_eq(&[1, 2, 3]), None);
     }
 
     #[test]

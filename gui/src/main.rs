@@ -9,7 +9,10 @@ use std::sync::mpsc;
 use adw::prelude::*;
 use gtk::glib;
 
-use redmi_buds::settings::{self, Gesture, GestureBinding, NoiseMode, EQ_PRESETS, GESTURE_ACTIONS};
+use redmi_buds::settings::{
+    self, CustomEq, EqBand, Gesture, GestureBinding, NoiseMode, EQ_PERSONALIZED, EQ_PRESETS,
+    GESTURE_ACTIONS,
+};
 use worker::{Ev, Req, Snapshot};
 
 const APP_ID: &str = "io.github.creeperkafasi.RedmiBuds";
@@ -19,7 +22,14 @@ const CSS: &str = "
 .battery-pct { font-size: 28pt; font-weight: 800; font-feature-settings: 'tnum'; }
 .battery-card levelbar block.filled { border-radius: 99px; }
 .battery-card levelbar trough { min-height: 8px; border-radius: 99px; }
+.eq-band { padding: 6px 12px; }
+.eq-band label.numeric { font-feature-settings: 'tnum'; }
+.eq-actions { padding: 12px; }
 ";
+
+/// Debounce for slider previews: the RCSP link is slow, so a drag sends one
+/// command after the user pauses instead of one per pixel.
+const PREVIEW_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
@@ -125,6 +135,16 @@ struct Ui {
     eq: adw::ToggleGroup,
     noise_group: adw::PreferencesGroup,
     noise: adw::ToggleGroup,
+    /// The preset the toggles currently show, so a slider drag can pick the
+    /// personalized one before previewing.
+    eq_id: Cell<Option<u8>>,
+    custom_group: adw::PreferencesGroup,
+    /// One slider per band, built from what the buds report.
+    custom_sliders: RefCell<Vec<(u16, gtk::Scale)>>,
+    /// The curve as edited in the UI; what Apply stores.
+    custom: RefCell<Vec<EqBand>>,
+    /// Pending debounced preview.
+    preview_timer: RefCell<Option<glib::SourceId>>,
     gestures_group: adw::PreferencesGroup,
     gesture_rows: RefCell<Vec<Rc<GestureRow>>>,
     find_target: adw::ToggleGroup,
@@ -153,6 +173,7 @@ impl Ui {
 
     fn set_eq(&self, eq: Option<u8>) {
         self.syncing.set(true);
+        self.eq_id.set(eq);
         // The toggle list is per model; an unlisted value must not be forced
         // into the group (libadwaita warns and shows nothing selected).
         match eq.filter(|p| EQ_PRESETS.iter().any(|(id, _)| id == p)) {
@@ -160,6 +181,159 @@ impl Ui {
             None => self.eq.set_active(gtk::INVALID_LIST_POSITION),
         }
         self.syncing.set(false);
+    }
+
+    /// Build the band sliders once, then keep them in sync with the device.
+    fn set_custom_eq(self: &Rc<Self>, eq: Option<CustomEq>) {
+        let Some(eq) = eq.filter(|e| !e.bands.is_empty()) else {
+            self.custom_group.set_visible(false);
+            return;
+        };
+        // Building a row calls `set_value`, which emits `value_changed`; guard
+        // the whole update so merely opening the window never writes.
+        self.syncing.set(true);
+        if self.custom_sliders.borrow().is_empty() {
+            for band in &eq.bands {
+                let row = self.band_row(*band, eq.bound);
+                self.custom_group.add(&row);
+            }
+            let actions = self.custom_actions();
+            self.custom_group.add(&actions);
+        }
+        self.custom_group.set_visible(true);
+        self.custom_group.set_description(Some(&format!(
+            "{} bands, ±{} dB. Drag a slider to hear it, then Apply to keep it \
+             — it plays as the Personalized preset.",
+            eq.bands.len(),
+            eq.bound
+        )));
+        for (freq, scale) in self.custom_sliders.borrow().iter() {
+            if let Some(band) = eq.bands.iter().find(|b| b.freq == *freq) {
+                scale.set_value(band.gain as f64);
+            }
+        }
+        *self.custom.borrow_mut() = eq.bands;
+        self.syncing.set(false);
+    }
+
+    /// One row: axis label, slider, live dB readout.
+    fn band_row(self: &Rc<Self>, band: EqBand, bound: i8) -> gtk::Box {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.add_css_class("eq-band");
+
+        let name = gtk::Label::new(Some(&band.label()));
+        name.set_width_chars(6);
+        name.set_xalign(0.0);
+        name.add_css_class("dim-label");
+
+        let scale = gtk::Scale::with_range(
+            gtk::Orientation::Horizontal,
+            -(bound as f64),
+            bound as f64,
+            1.0,
+        );
+        scale.set_hexpand(true);
+        scale.set_draw_value(false);
+        scale.set_round_digits(0);
+        scale.add_mark(0.0, gtk::PositionType::Bottom, None);
+        scale.set_value(band.gain as f64);
+
+        let value = gtk::Label::new(Some(&format!("{:+}", band.gain)));
+        value.set_width_chars(3);
+        value.set_xalign(1.0);
+        value.add_css_class("numeric");
+
+        let freq = band.freq;
+        {
+            let ui = Rc::downgrade(self);
+            let value = value.clone();
+            scale.connect_value_changed(move |s| {
+                let gain = s.value().round() as i8;
+                value.set_label(&format!("{gain:+}"));
+                let Some(ui) = ui.upgrade() else { return };
+                if ui.syncing.get() {
+                    return;
+                }
+                if let Some(band) = ui.custom.borrow_mut().iter_mut().find(|b| b.freq == freq) {
+                    band.gain = gain;
+                }
+                ui.schedule_preview();
+            });
+        }
+
+        row.append(&name);
+        row.append(&scale);
+        row.append(&value);
+        self.custom_sliders.borrow_mut().push((freq, scale));
+        row
+    }
+
+    /// Reset / Apply buttons under the sliders.
+    fn custom_actions(self: &Rc<Self>) -> gtk::Box {
+        let box_ = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        box_.add_css_class("eq-actions");
+        box_.set_halign(gtk::Align::End);
+
+        let reset = gtk::Button::builder()
+            .label("Reset")
+            .tooltip_text("Back to a flat curve")
+            .css_classes(["pill"])
+            .build();
+        let apply = gtk::Button::builder()
+            .label("Apply")
+            .tooltip_text("Store this curve and select Personalized")
+            .css_classes(["pill", "suggested-action"])
+            .build();
+
+        {
+            let ui = Rc::downgrade(self);
+            reset.connect_clicked(move |_| {
+                let Some(ui) = ui.upgrade() else { return };
+                ui.cancel_preview();
+                ui.send(Req::ResetCustomEq);
+            });
+        }
+        {
+            let ui = Rc::downgrade(self);
+            apply.connect_clicked(move |_| {
+                let Some(ui) = ui.upgrade() else { return };
+                ui.cancel_preview();
+                let bands = ui.custom.borrow().clone();
+                if !bands.is_empty() {
+                    ui.send(Req::SetCustomEq(bands));
+                }
+            });
+        }
+
+        box_.append(&reset);
+        box_.append(&apply);
+        box_
+    }
+
+    /// Queue a preview once the sliders settle. Preview alone does not change
+    /// the sound unless the personalized preset is selected, so pick it first
+    /// (the preview that follows overwrites the stored curve it reloads).
+    fn schedule_preview(self: &Rc<Self>) {
+        if self.eq_id.get() != Some(EQ_PERSONALIZED) {
+            self.eq_id.set(Some(EQ_PERSONALIZED));
+            self.send(Req::SetEq(EQ_PERSONALIZED));
+        }
+        self.cancel_preview();
+        let ui = self.clone();
+        let id = glib::timeout_add_local_once(PREVIEW_DELAY, move || {
+            ui.preview_timer.borrow_mut().take();
+            let bands = ui.custom.borrow().clone();
+            if !bands.is_empty() {
+                ui.send(Req::PreviewCustomEq(bands));
+            }
+        });
+        *self.preview_timer.borrow_mut() = Some(id);
+    }
+
+    fn cancel_preview(&self) {
+        if let Some(id) = self.preview_timer.borrow_mut().take() {
+            id.remove();
+        }
     }
 
     /// Noise-control mode comes back as `(mode, level)`; only the mode has a
@@ -264,6 +438,17 @@ impl Ui {
             Ev::Battery(b) => self.set_battery(&b),
             Ev::Eq(e) => self.set_eq(e),
             Ev::Anc(a) => self.set_noise(a),
+            Ev::CustomEq(eq, selected) => {
+                self.set_custom_eq(eq);
+                if selected {
+                    self.set_eq(Some(EQ_PERSONALIZED));
+                }
+                self.notify(if selected {
+                    "Custom equalizer applied"
+                } else {
+                    "Custom equalizer reset"
+                });
+            }
             Ev::Gestures(g) => {
                 self.set_gestures(&g);
                 self.notify("Gesture saved");
@@ -286,6 +471,7 @@ impl Ui {
         self.set_eq(s.eq);
         self.noise_group.set_visible(s.has_anc);
         self.set_noise(s.anc);
+        self.set_custom_eq(s.custom_eq);
         self.set_gestures(&s.gestures);
         self.serial_row
             .set_subtitle(s.serial.as_deref().unwrap_or("Unknown"));
@@ -368,6 +554,10 @@ fn build(app: &adw::Application, mac: String) {
     eq_scroll.set_propagate_natural_height(true);
     sound.add(&eq_scroll);
 
+    // Custom equalizer: rows are added once the device reports its bands.
+    let custom_group = group("Custom equalizer");
+    custom_group.set_visible(false);
+
     // Noise control
     let noise_group = group("Noise control");
     noise_group.set_description(Some("What the buds do with outside sound"));
@@ -436,7 +626,7 @@ fn build(app: &adw::Application, mac: String) {
     content.set_margin_start(12);
     content.set_margin_end(12);
     content.append(&battery_box);
-    for g in [&sound, &noise_group, &gestures_group, &find, &about] {
+    for g in [&sound, &custom_group, &noise_group, &gestures_group, &find, &about] {
         content.append(g);
     }
     let clamp = adw::Clamp::builder().maximum_size(640).child(&content).build();
@@ -499,6 +689,11 @@ fn build(app: &adw::Application, mac: String) {
         eq,
         noise_group,
         noise,
+        eq_id: Cell::new(None),
+        custom_group,
+        custom_sliders: RefCell::new(Vec::new()),
+        custom: RefCell::new(Vec::new()),
+        preview_timer: RefCell::new(None),
         gestures_group,
         gesture_rows: RefCell::new(Vec::new()),
         find_target,

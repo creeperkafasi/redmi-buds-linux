@@ -15,6 +15,7 @@ probably work too, but their feature sets differ. Reports are welcome.
 - Battery for each bud and the case, with charging state
 - Noise control: off, noise cancelling and transparency (on models with ANC)
 - EQ presets (Balanced, Vocal, Bass, Treble, Volume, Personalized)
+- Custom ten-band equalizer with live preview (models that support it, e.g. the 6 Lite)
 - Remap single, double and triple tap and press-and-hold, per bud
 - Find my buds: ring left, right or both
 - Raw access to every device-config id, for exploring
@@ -54,6 +55,10 @@ redmi-buds info
 redmi-buds eq get
 redmi-buds eq set 5                    # 0 balanced, 1 vocal, 5 bass, 6 treble,
                                        # 7 volume, 10 personalized
+redmi-buds eq custom get               # the custom curve (config id 55)
+redmi-buds eq custom set "-3,0,0,0,0,2,4,4,2,1"   # one gain per band
+redmi-buds eq custom set "62=-6,16000=3"          # or just some bands
+redmi-buds eq custom reset             # flat curve
 redmi-buds anc get                     # anc mode 1 (Noise cancelling)  level 0
 redmi-buds anc set transparency        # off | noise | transparency
 redmi-buds anc set noise 2             # optional level 0-2, model specific

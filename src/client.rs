@@ -9,8 +9,8 @@ use crate::auth;
 use crate::bt::{parse_mac, Rfcomm};
 use crate::rcsp::{self, Frame, APP_EARPHONE, APP_MIUI};
 use crate::settings::{
-    self, Gesture, GestureBinding, CFG_ANC, CFG_EQ, CFG_FIND, CFG_GESTURES, CFG_NOISE_CYCLE,
-    CFG_SERIAL,
+    self, EqBand, Gesture, GestureBinding, CFG_ANC, CFG_CUSTOM_EQ, CFG_EQ, CFG_FIND, CFG_GESTURES,
+    CFG_NOISE_CYCLE, CFG_SERIAL,
 };
 
 /// First paired device whose name looks like Xiaomi/Redmi buds, via `bluetoothctl`.
@@ -457,7 +457,49 @@ impl Buds {
             .map(|v| (v[0], v[1])))
     }
 
-    pub fn serial(&mut self) -> io::Result<Option<String>> {        Ok(self
+    /// The custom equalizer curve (config id 55), as the buds report it.
+    pub fn custom_eq(&mut self) -> io::Result<Option<settings::CustomEq>> {
+        Ok(self
+            .get_one(CFG_CUSTOM_EQ)?
+            .as_deref()
+            .and_then(settings::decode_custom_eq))
+    }
+
+    /// Store the curve without applying it.
+    ///
+    /// `CMD_SET_CUSTOM_EQ` only persists the bands: the sound does not change
+    /// until the curve is re-applied, either by re-selecting the personalized
+    /// preset (10) or by the preview command below.
+    pub fn store_custom_eq(&mut self, bands: &[EqBand]) -> io::Result<()> {
+        self.set_config(&[(CFG_CUSTOM_EQ, settings::encode_custom_eq(bands))])
+    }
+
+    /// Apply the curve now.
+    ///
+    /// `CMD_CUSTOM_EQ_PREVIEW` is what the app sends while a slider moves. On
+    /// the 6 Lite it is also the only command that moves the audio path right
+    /// away, and the firmware updates the config 55 report with it as well.
+    pub fn preview_custom_eq(&mut self, bands: &[EqBand]) -> io::Result<()> {
+        self.set_config(&[(CFG_CUSTOM_EQ, settings::encode_custom_eq_preview(bands))])
+    }
+
+    /// Flat custom curve.
+    ///
+    /// The reset command only stores the flat curve, so the reported bands are
+    /// previewed afterwards to make the change audible immediately.
+    pub fn reset_custom_eq(&mut self) -> io::Result<()> {
+        self.set_config(&[(CFG_CUSTOM_EQ, settings::encode_custom_eq_reset())])?;
+        if let Some(eq) = self.custom_eq()? {
+            if !eq.bands.is_empty() {
+                let preview = settings::encode_custom_eq_preview(&eq.bands);
+                self.set_config(&[(CFG_CUSTOM_EQ, preview)])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn serial(&mut self) -> io::Result<Option<String>> {
+        Ok(self
             .get_one(CFG_SERIAL)?
             .map(|v| String::from_utf8_lossy(&v).into_owned()))
     }

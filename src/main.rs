@@ -8,7 +8,7 @@ use std::process::ExitCode;
 use redmi_buds::auth;
 use redmi_buds::client::{find_paired_buds, Buds};
 use redmi_buds::rcsp;
-use redmi_buds::settings::{self, Gesture, NoiseMode};
+use redmi_buds::settings::{self, EqBand, Gesture, NoiseMode};
 
 const USAGE: &str = "\
 redmi-buds - control Redmi/Xiaomi buds over Bluetooth RFCOMM
@@ -28,6 +28,12 @@ COMMANDS:
     eq get            read the EQ preset (config id 7)
     eq set <0-13>     set the EQ preset (0 balanced, 1 vocal, 5 bass,
                       6 treble, 7 volume, 10 personalized)
+    eq custom get     show the custom curve (config id 55)
+    eq custom set <-3,0,2,...> [--no-select]
+                      one gain per band, or 62=-3,1000=2 for single bands;
+                      stores, applies and selects the personalized preset
+                      unless --no-select
+    eq custom reset   back to a flat custom curve
     anc get           noise control mode and level (config id 11)
     anc set <MODE> [LEVEL]
                       MODE: off, noise, transparency; LEVEL 0-2 (default: keep)
@@ -45,9 +51,16 @@ enum Cmd {
     Info,
     Battery,
     EqGet,
+    EqSet(u8),
+    EqCustomGet,
+    EqCustomSet {
+        /// `-3,0,2,…` (one gain per band) or `62=-3,1000=2`.
+        gains: String,
+        select: bool,
+    },
+    EqCustomReset,
     AncGet,
     AncSet(u8, Option<u8>),
-    EqSet(u8),
     Get(Vec<u16>),
     Set(u16, Vec<u8>),
     Find { stop: bool, device: u8 },
@@ -73,6 +86,52 @@ fn parse_u16(s: &str) -> Result<u16, String> {
         s.parse::<u16>()
     };
     v.map_err(|_| format!("invalid id: {s}"))
+}
+
+fn parse_gain(s: &str) -> Option<i8> {
+    s.trim().trim_start_matches('+').parse::<i8>().ok()
+}
+
+/// `-3,0,2` (one gain per band, same order as `eq custom get`) or
+/// `62=-3,1000=2` (only the named bands).
+fn apply_gains(bands: &[EqBand], arg: &str) -> Result<Vec<EqBand>, String> {
+    let mut out = bands.to_vec();
+    if arg.contains('=') {
+        for part in arg.split(',') {
+            let (freq, gain) = part
+                .split_once('=')
+                .ok_or_else(|| format!("bad band: {part}"))?;
+            let freq: u16 = freq
+                .trim()
+                .trim_end_matches("Hz")
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad frequency: {freq}"))?;
+            let gain = parse_gain(gain).ok_or_else(|| format!("bad gain: {gain}"))?;
+            let band = out
+                .iter_mut()
+                .find(|b| b.freq == freq)
+                .ok_or_else(|| format!("no band at {freq} Hz; see `eq custom get`"))?;
+            band.gain = gain;
+        }
+    } else {
+        let gains: Vec<i8> = arg
+            .split(',')
+            .map(parse_gain)
+            .collect::<Option<Vec<i8>>>()
+            .ok_or("gains must be numbers, e.g. -3,0,2")?;
+        if gains.len() != out.len() {
+            return Err(format!(
+                "expected {} gains, got {}; see `eq custom get`",
+                out.len(),
+                gains.len()
+            ));
+        }
+        for (band, gain) in out.iter_mut().zip(gains) {
+            band.gain = gain;
+        }
+    }
+    Ok(out)
 }
 
 fn parse_args() -> Result<Opts, String> {
@@ -144,7 +203,20 @@ where
                 }
                 Cmd::EqSet(n)
             }
-            _ => return Err("usage: eq get | eq set <0-13>".into()),
+            Some("custom") => {
+                let usage = "usage: eq custom get | eq custom set <dB,...> [--no-select] \
+                             | eq custom reset";
+                match args.get(2).map(String::as_str) {
+                    Some("get") => Cmd::EqCustomGet,
+                    Some("reset") => Cmd::EqCustomReset,
+                    Some("set") => Cmd::EqCustomSet {
+                        gains: args.get(3).ok_or(usage)?.clone(),
+                        select: !args.iter().any(|a| a == "--no-select"),
+                    },
+                    _ => return Err(usage.into()),
+                }
+            }
+            _ => return Err("usage: eq get | eq set <0-13> | eq custom ...".into()),
         },
         "anc" => {
             let usage = "usage: anc get | anc set <off|noise|transparency> [level 0-2]";
@@ -170,7 +242,8 @@ where
                 _ => return Err(usage.into()),
             }
         }
-        "gesture" => match args.get(1).map(String::as_str) {            Some("get") => Cmd::GestureGet,
+        "gesture" => match args.get(1).map(String::as_str) {
+            Some("get") => Cmd::GestureGet,
             Some("set") => {
                 let usage = "usage: gesture set <single|double|triple|long> <left|right|both> <ACTION>";
                 let g = args.get(2).and_then(|s| Gesture::parse(s)).ok_or(usage)?;
@@ -381,6 +454,60 @@ fn run(opts: &Opts) -> Result<(), String> {
         Cmd::EqSet(n) => {
             buds.set_eq(*n).map_err(|e| e.to_string())?;
             println!("eq preset set to {n}");
+        }
+        Cmd::EqCustomGet => {
+            let eq = buds.custom_eq().map_err(|e| e.to_string())?;
+            match eq.filter(|e| !e.bands.is_empty()) {
+                Some(eq) => {
+                    println!(
+                        "custom eq  {} bands, ±{} dB, mode {} ({})",
+                        eq.bands.len(),
+                        eq.bound,
+                        eq.mode,
+                        settings::eq_name(eq.mode).unwrap_or("unnamed")
+                    );
+                    for band in &eq.bands {
+                        println!("  {:>8}  {:+}", band.label(), band.gain);
+                    }
+                }
+                None => println!("custom eq (absent)"),
+            }
+        }
+        Cmd::EqCustomSet { gains, select } => {
+            let stored = buds.custom_eq().map_err(|e| e.to_string())?.unwrap_or_default();
+            if stored.bands.is_empty() {
+                return Err("these buds report no custom eq bands".into());
+            }
+            let bands = apply_gains(&stored.bands, gains)?;
+            // Store, then apply: the set command alone is inaudible until the
+            // personalized preset is (re)selected, preview moves the DSP now.
+            buds.store_custom_eq(&bands)
+                .map_err(|e| e.to_string())?;
+            buds.preview_custom_eq(&bands)
+                .map_err(|e| e.to_string())?;
+            let selected = if *select {
+                buds.set_eq(settings::EQ_PERSONALIZED)
+                    .map_err(|e| e.to_string())?;
+                true
+            } else {
+                false
+            };
+            println!(
+                "saved {} bands{}",
+                bands.len(),
+                if selected {
+                    format!(" (selected preset {})", settings::EQ_PERSONALIZED)
+                } else {
+                    String::new()
+                }
+            );
+            for band in &bands {
+                println!("  {:>8}  {:+}", band.label(), band.gain);
+            }
+        }
+        Cmd::EqCustomReset => {
+            buds.reset_custom_eq().map_err(|e| e.to_string())?;
+            println!("custom eq reset");
         }
         Cmd::Get(ids) => {
             let cfg = buds.get_config(ids).map_err(|e| e.to_string())?;

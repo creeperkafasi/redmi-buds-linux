@@ -9,7 +9,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use redmi_buds::client::Buds;
-use redmi_buds::settings::{Gesture, GestureBinding};
+use redmi_buds::settings::{self, EqBand, Gesture, GestureBinding, EQ_PERSONALIZED};
 
 const POLL: Duration = Duration::from_secs(20);
 const RETRY: Duration = Duration::from_secs(8);
@@ -22,6 +22,11 @@ pub enum Req {
     SetAnc(u8),
     SetGesture(Gesture, Option<u8>, Option<u8>),
     Find { ring: bool, device: u8 },
+    /// Store the curve and make it the active preset.
+    SetCustomEq(Vec<EqBand>),
+    /// Audition a curve without storing it (slider drag).
+    PreviewCustomEq(Vec<EqBand>),
+    ResetCustomEq,
 }
 
 #[derive(Default, Clone)]
@@ -32,6 +37,8 @@ pub struct Snapshot {
     /// Noise-control mode and level (config id 11).
     pub anc: Option<(u8, u8)>,
     pub has_anc: bool,
+    /// Custom equalizer curve (config id 55).
+    pub custom_eq: Option<settings::CustomEq>,
     pub gestures: Vec<GestureBinding>,
     pub serial: Option<String>,
     pub mac: String,
@@ -44,6 +51,8 @@ pub enum Ev {
     Gestures(Vec<GestureBinding>),
     Eq(Option<u8>),
     Anc(Option<(u8, u8)>),
+    /// The curve as the buds report it; `selected` when preset 10 was picked.
+    CustomEq(Option<settings::CustomEq>, bool),
     /// Something the user did failed; the session is still fine.
     Failed(String),
     Disconnected(String),
@@ -64,6 +73,7 @@ fn snapshot(buds: &mut Buds, mac: &str) -> std::io::Result<Snapshot> {
         eq: buds.get_eq()?,
         anc: buds.get_anc()?,
         has_anc,
+        custom_eq: buds.custom_eq()?,
         gestures: buds.get_gestures()?,
         serial: buds.serial()?,
         mac: mac.to_string(),
@@ -148,6 +158,20 @@ pub fn run(mac: String, reqs: Receiver<Req>, events: async_channel::Sender<Ev>) 
                 .and_then(|_| buds.get_gestures())
                 .map(|g| Some(Ev::Gestures(g))),
             Req::Find { ring, device } => buds.find_device(ring, device).map(|_| None),
+            // Preview: the app's live-drag command, applied immediately. The
+            // firmware updates the config 55 report with it too, so the curve
+            // is not read back here (that would just echo the slider values).
+            Req::PreviewCustomEq(bands) => buds.preview_custom_eq(&bands).map(|_| None),
+            Req::SetCustomEq(bands) => buds
+                .store_custom_eq(&bands)
+                .and_then(|_| buds.preview_custom_eq(&bands))
+                .and_then(|_| buds.set_eq(EQ_PERSONALIZED))
+                .and_then(|_| buds.custom_eq())
+                .map(|eq| Some(Ev::CustomEq(eq, true))),
+            Req::ResetCustomEq => buds
+                .reset_custom_eq()
+                .and_then(|_| buds.custom_eq())
+                .map(|eq| Some(Ev::CustomEq(eq, false))),
         };
 
         let ok = match result {
